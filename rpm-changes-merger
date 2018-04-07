@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+#
+# rpm-changes-merger: git merge driver for RPM .changes log files
+#
+# Copyright 2018 Aurelien Aptel <aaptel@suse.com>
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import os, sys, re
+import locale
+import unittest
+import threading
+import datetime
+from pprint import pprint as P
+import email.utils
+
+SEPARATOR = "-"*67
+SEPARATOR_RX = re.compile(r"""^-----+\n""", flags=re.MULTILINE)
+DATE_RX = re.compile(r"""^\s*(\S+ +\S+ +\d+ +(?:\d|:){8} .+) - .*@.*""")
+
+def parse_date(s):
+    tt = email.utils.parsedate_tz(s)
+    if tt is None: return None
+    tz = datetime.timezone(datetime.timedelta(seconds=tt[9]))
+    return datetime.datetime(*tt[:5]+(min(tt[5], 59),), tzinfo=tz)
+
+def entries_same_header(a, b):
+    return a.split("\n")[0] == b.split("\n")[0]
+
+class Changelog:
+    def __init__(self, filename=None, string=None):
+        if filename:
+            self.read_file(filename)
+        if string:
+            self.read_string(string)
+
+    def read_file(self, filename):
+        with open(filename, encoding="utf-8") as f:
+            self.read_string(f.read())
+
+    def read_string(self, text):
+        self._logs = []
+        chunks = SEPARATOR_RX.split(text)
+        assert chunks[0] == ""
+
+        for c in chunks[1:]:
+            m = DATE_RX.match(c)
+            assert m
+            d = m.group(1)
+            self._logs.append([d, c])
+
+        for x in self._logs:
+            x[0] = parse_date(x[0])
+
+    def dump(self, filename=None):
+        x = []
+        for d,c in self._logs:
+            x.append(SEPARATOR)
+            x.append("\n")
+            x.append(c)
+        r = "".join(x)
+        if filename:
+            with open(filename, "w+", encoding="utf-8") as f:
+                f.write(r)
+        return r
+
+    def sort(self):
+        list.sort(self._logs, key=lambda x: x[0], reverse=True)
+
+    def sorted(self):
+        new = Changelog()
+        new._logs = sorted(self._logs, key=lambda x: x[0], reverse=True)
+        return new
+
+    def insert(self, texts, sort=True):
+        logs = []
+        for t in texts:
+            m = DATE_RX.match(t)
+            d = parse_date(m.group(1))
+            logs.append([d, t])
+
+        if sort:
+            self._logs.extend(logs)
+            self.sort()
+        else:
+            # we don't want to move around existing entries so insert all
+            # new entries on top
+            list.sort(logs, key=lambda x: x[0])
+            for x in logs:
+                self._logs.insert(0, x)
+
+    def new_from(self, other):
+        """Return a list of entries in OTHER we don't have or False if OTHER
+        is missing entries from us"""
+        aset = set([x[1] for x in self._logs])
+        bset = set([x[1] for x in other._logs])
+
+        new = bset - aset
+        rem = aset - bset
+
+        if rem:
+            return False
+
+        return new
+
+def main():
+    ap = argparse.ArgumentParser(description='RPM changes file merger')
+    ap.add_argument('-o', '--output', metavar='FILE',
+                    help="file to output final result (stdout by default)")
+    ap.add_argument('-s','--sort', action='store_true', default=False,
+                    help="sort whole file based on dates (NOTE: this might move existing entries around)")
+    ap.add_argument('basefile', help="base change file to add to")
+    ap.add_argument('newfile', nargs='+', help="new file to merge change from")
+    args = ap.parse_args()
+    new = set()
+    base = Changelog(filename=args.basefile)
+    for f in args.newfile:
+        r = base.new_from(Changelog(filename=f))
+        if r is False:
+            print("%s is missing changes from base file %s"%(f, args.basefile), file=sys.stderr)
+            exit(1)
+        new |= r
+    base.insert(new, sort=args.sort)
+    if args.output:
+        base.dump(filename=args.output)
+    else:
+        try:
+            sys.stdout.write(base.dump())
+        except BrokenPipeError:
+            pass
+
+
+#######################
+#       TESTS
+#######################
+
+class TestChangelog(unittest.TestCase):
+    def test_id(self):
+        with open("test/a", encoding="utf-8") as f:
+            a = f.read()
+            ch = Changelog(string=a)
+            b = ch.dump()
+            self.assertEqual(a, b)
+            ch = Changelog(filename="test/a")
+            b = ch.dump()
+            self.assertEqual(a, b)
+
+    def test_sort(self):
+        a=''
+        a+=SEPARATOR+'\nTue Mar 13 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+        a+=SEPARATOR+'\nTue Mar 14 09:49:44 UTC 2018 - jmcdonough@suse.com\n- new\n'
+
+        b=''
+        b+=SEPARATOR+'\nTue Mar 14 09:49:44 UTC 2018 - jmcdonough@suse.com\n- new\n'
+        b+=SEPARATOR+'\nTue Mar 13 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+
+        ca = Changelog(string=a)
+        cb = ca.sorted()
+        self.assertEqual(cb.dump(), b)
+
+    def test_insert(self):
+        new = 'Tue Mar 14 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+
+        a=''
+        a+=SEPARATOR+'\nTue Mar 13 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+        a+=SEPARATOR+'\nTue Mar 15 09:49:44 UTC 2018 - jmcdonough@suse.com\n- new\n'
+
+        b=''
+        b+=SEPARATOR+'\nTue Mar 15 09:49:44 UTC 2018 - jmcdonough@suse.com\n- new\n'
+        b+=SEPARATOR+'\n'+new
+        b+=SEPARATOR+'\nTue Mar 13 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+
+        ca = Changelog(string=a)
+        ca.insert(new)
+        self.assertEqual(ca.dump(), b)
+
+    def test_add_new(self):
+        new = 'Tue Mar 14 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+
+        a=''
+        a+=SEPARATOR+'\nTue Mar 13 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+        a+=SEPARATOR+'\nTue Mar 15 09:49:44 UTC 2018 - jmcdonough@suse.com\n- new\n'
+
+        b=''
+        b+=SEPARATOR+'\nTue Mar 15 09:49:44 UTC 2018 - jmcdonough@suse.com\n- new\n'
+        b+=SEPARATOR+'\n'+new
+        b+=SEPARATOR+'\nTue Mar 13 09:49:44 UTC 2018 - jmcdonough@suse.com\n- old\n'
+
+        ca = Changelog(string=a)
+        cb = Changelog(string=b)
+        self.assertTrue(ca.merge_new_from(cb))
+        self.assertEqual(ca.dump(), b)
+
+if __name__ == '__main__':
+    main()
