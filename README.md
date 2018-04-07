@@ -4,7 +4,7 @@ This script is able to do 3-way merges for .changes file
 automatically.
 
 
-Give this scenario:
+Given this scenario:
 
 
     branch A (added entries)                   branch B (added entries)
@@ -23,10 +23,12 @@ pretty easy to solve: add both entries ordered by their timestamp.
 If any branches removes or edit previous entries the script will also
 fail and let you sort it out.
 
+Run the script with -h or --help for more.
+
 # Installation
 
-Simply copy the script or symlink it to directory in your $PATH or use
-full paths to the script in the configuration.
+Simply copy the script or symlink it to a directory in your $PATH or
+use full paths to the script in the configuration.
 
 ## Global
 
